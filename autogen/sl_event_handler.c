@@ -15,6 +15,7 @@
 #include "sl_iostream_init_eusart_instances.h"
 #include "sl_iostream_stdlib_config.h"
 #include "sl_mbedtls.h"
+#include "sl_uartdrv_instances.h"
 #include "sl_cli_instances.h"
 #include "psa/crypto.h"
 #include "sl_se_manager.h"
@@ -58,6 +59,7 @@ void sl_driver_init(void)
 {
   sl_debug_swo_init();
   sl_gpio_init();
+  sl_uartdrv_init_instances();
   sl_cos_send_config();
 }
 

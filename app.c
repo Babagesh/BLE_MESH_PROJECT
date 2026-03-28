@@ -38,6 +38,8 @@
 #endif // SL_CATALOG_CLI_PRESENT
 #include "app.h"
 #include "sl_main_init.h"
+#include "sl_uartdrv_instances.h"
+
 
 // connection parameters
 #define CONN_INTERVAL_MIN             80   //100ms
@@ -104,9 +106,9 @@ static uint8_t active_connections_num;
 // State of the connection under establishment
 static conn_state_t conn_state;
 // Health Thermometer service UUID defined by Bluetooth SIG
-static const uint8_t thermo_service[2] = { 0x09, 0x18 };
+static const uint8_t thermo_service[2] = { 0x00, 0x34 };
 // Temperature Measurement characteristic UUID defined by Bluetooth SIG
-static const uint8_t thermo_char[2] = { 0x1c, 0x2a };
+static const uint8_t thermo_char[2] = { 0x01, 0x34 };
 // Print out tx power value
 static bool print_tx_power = PRINT_TX_POWER_DEFAULT;
 
@@ -122,6 +124,20 @@ static void print_bluetooth_address(void);
 // Print RSSI and temperature values
 static void print_values(void);
 
+static UARTDRV_Handle_t uart_handle;
+volatile bool command_ready = false;
+char uart_rx_buffer[32];
+volatile int rx_index = 0;
+uint8_t rx_byte;
+bd_addr target_addr;
+uint8_t target_addr_type;
+typedef enum {
+    UART_IDLE,
+    UART_WAITING_FOR_CONNECTION_ANSWER,
+    UART_CHATTING
+} uart_state_t;
+
+volatile uart_state_t current_uart_state = UART_IDLE;
 /**************************************************************************//**
  * Application Init.
  *****************************************************************************/
@@ -129,16 +145,40 @@ void app_init(void)
 {
   // Initialize connection properties
   init_properties();
-  app_log_info("soc_thermometer_client initialized." APP_LOG_NL);
   /////////////////////////////////////////////////////////////////////////////
   // Put your additional application init code here!                         //
   // This is called once during start-up.                                    //
   /////////////////////////////////////////////////////////////////////////////
+  uart_handle = sl_uartdrv_get_default();
 }
 
 /**************************************************************************//**
  * Application Process Action.
  *****************************************************************************/
+void uart_rx_callback(UARTDRV_Handle_t handle, Ecode_t transferStatus, uint8_t *data, UARTDRV_Count_t transferCount)
+{
+  char byte = (char)data[0];
+  if(byte == '\r')
+    {
+      UARTDRV_Receive(uart_handle, &rx_byte, 1, uart_rx_callback);
+      return;
+    }
+  else if(byte == '\n')
+    {
+      uart_rx_buffer[rx_index] = '\0';
+      command_ready = true;
+      rx_index = 0;
+    }
+  else
+    {
+      if(rx_index < (sizeof(uart_rx_buffer) - 1))
+        {
+          uart_rx_buffer[rx_index] = byte;
+          rx_index ++;
+        }
+    }
+  UARTDRV_Receive(uart_handle, &rx_byte, 1, uart_rx_callback);
+}
 void app_process_action(void)
 {
   if (app_is_process_required()) {
@@ -147,6 +187,28 @@ void app_process_action(void)
     // This is will run each time app_proceed() is called.                     //
     // Do not call blocking functions from here!                               //
     /////////////////////////////////////////////////////////////////////////////
+
+    if (command_ready)
+      {
+        switch(current_uart_state)
+        {
+          case UART_WAITING_FOR_CONNECTION_ANSWER:
+            if (strncmp(uart_rx_buffer, "y", 1) == 0)
+            {
+                sl_bt_connection_open(target_addr, target_addr_type, sl_bt_gap_phy_1m, NULL);
+                conn_state = opening;
+                current_uart_state = UART_CHATTING;
+            }
+            else if (strncmp(uart_rx_buffer, "n", 1) == 0)
+            {
+                sl_bt_scanner_start(sl_bt_scanner_scan_phy_1m, sl_bt_scanner_discover_generic);
+                conn_state = scanning;
+                current_uart_state = UART_IDLE;
+            }
+            break;
+        }
+        command_ready = false;
+      }
   }
 }
 
@@ -171,7 +233,7 @@ void sl_bt_on_event(sl_bt_msg_t* evt)
     // Do not call any stack command before receiving this boot event!
     case sl_bt_evt_system_boot_id:
       // Print boot message.
-      app_log_info("Bluetooth stack booted: v%d.%d.%d+%08lx" APP_LOG_NL,
+      app_log_info("Bluetooth stack booted: v%d.%d.%d+%08lx\r\n" APP_LOG_NL,
                    evt->data.evt_system_boot.major,
                    evt->data.evt_system_boot.minor,
                    evt->data.evt_system_boot.patch,
@@ -202,20 +264,56 @@ void sl_bt_on_event(sl_bt_msg_t* evt)
       if (evt->data.evt_scanner_legacy_advertisement_report.event_flags
           == (SL_BT_SCANNER_EVENT_FLAG_CONNECTABLE | SL_BT_SCANNER_EVENT_FLAG_SCANNABLE)) {
         // If a thermometer advertisement is found...
-        if (find_service_in_advertisement(&(evt->data.evt_scanner_legacy_advertisement_report.data.data[0]),
-                                          evt->data.evt_scanner_legacy_advertisement_report.data.len) != 0) {
+        if (find_service_in_advertisement(&(evt->data.evt_scanner_legacy_advertisement_report.data.data[0]),evt->data.evt_scanner_legacy_advertisement_report.data.len) != 0)
+          {
           // then stop scanning for a while
-          sc = sl_bt_scanner_stop();
-          app_assert_status(sc);
-          // and connect to that device
-          if (active_connections_num < SL_BT_CONFIG_MAX_CONNECTIONS) {
-            sc = sl_bt_connection_open(evt->data.evt_scanner_legacy_advertisement_report.address,
-                                       evt->data.evt_scanner_legacy_advertisement_report.address_type,
-                                       sl_bt_gap_phy_1m,
-                                       NULL);
+            sc = sl_bt_scanner_stop();
+            current_uart_state = UART_WAITING_FOR_CONNECTION_ANSWER;
+            int8_t rssi = evt->data.evt_scanner_legacy_advertisement_report.rssi;
+            uint8_t * adv_data = evt->data.evt_scanner_legacy_advertisement_report.data.data;
+            uint8_t adv_len = evt->data.evt_scanner_legacy_advertisement_report.data.len;
+            char device_name[32] = {0};
+            int i = 0;
+            while(i < adv_len)
+              {
+                uint8_t length = adv_data[i];
+                if(length == 0){
+                  break;
+                }
+                uint8_t type = adv_data[i + 1];
+                if(type == 0x08 || type == 0x09)
+                  {
+                    uint8_t name_len = length - 1;
+                    if (name_len >= sizeof(device_name))
+                    {
+                      name_len = sizeof(device_name) - 1;
+                    }
+                    memcpy(device_name, &adv_data[i + 2], name_len);
+                    device_name[name_len] = '\0';
+                    break;
+                  }
+                i += length + 1;
+
+              }
+            target_addr = evt->data.evt_scanner_legacy_advertisement_report.address;
+            target_addr_type = evt->data.evt_scanner_legacy_advertisement_report.address_type;
+            app_log_info("Device name: %s\r\n", device_name);
+            app_log_info("Device RSSI: %d\r\n", rssi);
             app_assert_status(sc);
-            conn_state = opening;
-          }
+            // and connect to that device if user wants too
+            uart_handle = sl_uartdrv_get_default();
+            char uart_tx_string[128];
+            sprintf(uart_tx_string, "Would you like to connect to the peripheral? Enter y or n\r\n");
+            UARTDRV_TransmitB(uart_handle, (uint8_t *)uart_tx_string, strlen(uart_tx_string));
+            if (active_connections_num < SL_BT_CONFIG_MAX_CONNECTIONS)
+              {
+              sc = sl_bt_connection_open(evt->data.evt_scanner_legacy_advertisement_report.address,
+                                         evt->data.evt_scanner_legacy_advertisement_report.address_type,
+                                         sl_bt_gap_phy_1m,
+                                         NULL);
+              app_assert_status(sc);
+              conn_state = opening;
+            }
         }
       }
       break;
@@ -559,7 +657,7 @@ static void print_bluetooth_address(void)
   bd_addr *address = read_and_cache_bluetooth_address(&address_type);
 
   app_log_info("Bluetooth %s address: %02X:%02X:%02X:%02X:%02X:%02X" APP_LOG_NL,
-               address_type ? "static random" : "public device",
+               address_type ? "static random" : "public device\r\n",
                address->addr[5],
                address->addr[4],
                address->addr[3],

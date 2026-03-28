@@ -30,3 +30,5 @@ sl_rail_util_power_manager_init_config.h=-234538768
 sl_rail_util_pti_config.h=256860112
 sl_rail_util_sequencer_config.h=2038517575
 sl_sleeptimer_config.h=847044378
+sl_uartdrv_eusart_vcom_config.h=-1200079686
+uartdrv_config.h=-342230900
